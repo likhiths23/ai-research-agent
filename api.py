@@ -1,12 +1,12 @@
 # api.py
-import os
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+import os
 from dotenv import load_dotenv
 from langchain.agents import create_react_agent, AgentExecutor
-from langchain_core.prompts import PromptTemplate
 from langchain_core.tools import Tool
+from langchain_core.prompts import PromptTemplate
 from langchain_groq import ChatGroq
 
 from tools.pdf_tool import pdf_search_tool
@@ -15,22 +15,22 @@ from tools.citation_tool import citation_tool
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="AI Research Agent API")
 
-# Allow frontend (Lovable/Vercel) to call this backend
+# CORS middleware - allows frontend to call API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change to specific domain if needed
+    allow_origins=["*"],  # In production, specify your Lovable domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Initialize LLM & Tools ---
+# Initialize LLM and Agent
 llm = ChatGroq(
     groq_api_key=os.getenv("GROQ_API_KEY"),
     model_name="llama-3.1-8b-instant",
-    temperature=0.3,
+    temperature=0.3
 )
 
 tools = [
@@ -47,7 +47,7 @@ tools = [
     Tool(
         name="Citation_Generator",
         func=lambda text: citation_tool(title=text),
-        description="Generate citations for papers."
+        description="Generate formatted citations."
     )
 ]
 
@@ -55,36 +55,71 @@ template = """Answer the following questions as best you can. You have access to
 
 {tools}
 
-Use the format:
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+Begin!
 
 Question: {input}
-Thought: {agent_scratchpad}
-"""
+Thought: {agent_scratchpad}"""
 
 prompt = PromptTemplate.from_template(template)
 agent = create_react_agent(llm, tools, prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+agent_executor = AgentExecutor(
+    agent=agent,
+    tools=tools,
+    verbose=True,
+    handle_parsing_errors=True,
+    max_iterations=10
+)
 
-class Query(BaseModel):
+# Request/Response Models
+class QueryRequest(BaseModel):
     question: str
 
-@app.post("/query")
-def query_agent(data: Query):
+class QueryResponse(BaseModel):
+    answer: str
+    success: bool
+
+# API Endpoints
+@app.get("/")
+async def root():
+    return {
+        "message": "AI Research Agent API",
+        "status": "running",
+        "endpoints": {
+            "/query": "POST - Submit research questions",
+            "/health": "GET - Check API health"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "message": "API is running"}
+
+@app.post("/query", response_model=QueryResponse)
+async def query_agent(request: QueryRequest):
     try:
-        result = agent_executor.invoke({"input": data.question})
-        return {"response": result["output"]}
+        if not request.question or len(request.question.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Question cannot be empty")
+        
+        response = agent_executor.invoke({"input": request.question})
+        
+        return QueryResponse(
+            answer=response["output"],
+            success=True
+        )
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
 
-@app.post("/upload-pdfs")
-async def upload_pdfs(files: list[UploadFile]):
-    import tempfile, shutil, subprocess
-    pdf_paths = []
-    for file in files:
-        tmp_path = os.path.join(tempfile.gettempdir(), file.filename)
-        with open(tmp_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-        pdf_paths.append(tmp_path)
-
-    subprocess.run(["python", "ingest_pdfs.py", *pdf_paths])
-    return {"status": "PDFs ingested successfully!"}
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
